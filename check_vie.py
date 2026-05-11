@@ -5,7 +5,6 @@ import unicodedata
 from pathlib import Path
 
 import requests
-from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 
@@ -14,6 +13,17 @@ DISCORD_WEBHOOK_URL = os.environ["DISCORD_WEBHOOK_URL"]
 LATEST_URL = "https://mon-vie-via.businessfrance.fr/offres/recherche?latest=true"
 BASE_URL = "https://mon-vie-via.businessfrance.fr"
 SEEN_FILE = Path("seen_offers.json")
+
+
+def clean_text(text):
+    return re.sub(r"\s+", " ", text or "").strip()
+
+
+def normalize(text):
+    text = text or ""
+    text = unicodedata.normalize("NFD", text)
+    text = "".join(char for char in text if unicodedata.category(char) != "Mn")
+    return clean_text(text).lower()
 
 
 def load_seen():
@@ -32,47 +42,24 @@ def save_seen(seen):
         json.dump(sorted(list(seen)), f, ensure_ascii=False, indent=2)
 
 
-def clean_text(text):
-    return re.sub(r"\s+", " ", text or "").strip()
-
-
-def normalize(text):
-    text = text or ""
-    text = unicodedata.normalize("NFD", text)
-    text = "".join(char for char in text if unicodedata.category(char) != "Mn")
-    return clean_text(text).lower()
-
-
-def get_rendered_page(page, url):
-    print(f"Ouverture de la page : {url}")
+def get_page_text(page, url):
+    print(f"Ouverture : {url}")
 
     try:
         page.goto(url, wait_until="domcontentloaded", timeout=90000)
     except PlaywrightTimeoutError:
-        print("La page a mis trop longtemps à charger, mais on essaie quand même de lire le contenu.")
+        print("Timeout au chargement, on continue quand même.")
 
-    page.wait_for_timeout(8000)
+    page.wait_for_timeout(10000)
 
-    text = ""
-    html = ""
-
-    for _ in range(12):
-        try:
-            text = page.locator("body").inner_text(timeout=10000)
-            html = page.content()
-
-            if len(text.strip()) > 300 and not text.strip().lower().startswith("loading"):
-                return text, html, page.url
-        except Exception:
-            pass
-
-        page.wait_for_timeout(2000)
-
-    return text, html, page.url
+    try:
+        return page.locator("body").inner_text(timeout=15000)
+    except Exception:
+        return ""
 
 
 def extract_offer_links(page):
-    text, html, final_url = get_rendered_page(page, LATEST_URL)
+    get_page_text(page, LATEST_URL)
 
     links = []
 
@@ -82,130 +69,136 @@ def extract_offer_links(page):
         raw_links = []
 
     for href in raw_links:
-        match = re.search(r"https://mon-vie-via\.businessfrance\.fr/(?:en/)?offres/(\d+)", href)
+        if not href:
+            continue
+
+        match = re.search(r"/offres/(\d+)", href)
         if match:
             offer_url = f"{BASE_URL}/offres/{match.group(1)}"
             if offer_url not in links:
                 links.append(offer_url)
 
-    for offer_id in re.findall(r"/(?:en/)?offres/(\d+)", html):
-        offer_url = f"{BASE_URL}/offres/{offer_id}"
-        if offer_url not in links:
-            links.append(offer_url)
-
-    print(f"{len(links)} lien(s) d'offre trouvé(s).")
-
-    return links[:20]
+    print(f"Liens trouvés : {links}")
+    return links[:10]
 
 
-def lines_from_text(text):
+def get_lines(text):
     return [clean_text(line) for line in text.splitlines() if clean_text(line)]
 
 
-def get_value_after_label(lines, labels):
-    normalized_labels = [normalize(label) for label in labels]
-
-    known_labels = [
-        "Entreprise", "Company",
-        "Durée", "Durée (mois)", "Duration", "Duration (months)",
-        "Ville", "City",
-        "Pays", "Country",
-        "Salaire", "Salary", "Indemnité", "Allowance",
-        "Début", "Start", "Date de début", "Start date",
-        "Fin", "End", "Date de fin", "End date",
-        "Lien", "Link"
-    ]
-
-    normalized_known_labels = [normalize(label) for label in known_labels]
+def find_after(lines, possible_labels):
+    labels = [normalize(label) for label in possible_labels]
 
     for i, line in enumerate(lines):
-        normalized_line = normalize(line)
+        line_n = normalize(line)
 
-        for label in normalized_labels:
-            if normalized_line == label or normalized_line.startswith(label + " "):
-                for candidate in lines[i + 1:i + 5]:
-                    normalized_candidate = normalize(candidate)
+        for label in labels:
+            if line_n == label or line_n.startswith(label):
+                for value in lines[i + 1:i + 6]:
+                    value_n = normalize(value)
 
-                    if normalized_candidate not in normalized_known_labels:
-                        if len(candidate) <= 120:
-                            return candidate
+                    if value_n not in labels and len(value) <= 120:
+                        return value
 
     return "Non indiqué"
 
 
-def find_title(lines, html):
-    soup = BeautifulSoup(html, "html.parser")
-
-    h1 = soup.find("h1")
-    if h1 and clean_text(h1.get_text()):
-        return clean_text(h1.get_text())
-
-    title_patterns = [
-        r".+\(H/F\)",
-        r".+\(F/H\)",
-        r".+\(M/F\)",
-        r".+\(H/F/X\)"
-    ]
+def find_title(lines):
+    for line in lines:
+        if "(H/F)" in line or "(F/H)" in line or "(M/F)" in line:
+            return line
 
     for line in lines:
-        for pattern in title_patterns:
-            if re.search(pattern, line, re.IGNORECASE):
-                return line
+        if len(line) > 10 and line.isupper():
+            return line
 
     return "Nouvelle offre V.I.E"
 
 
-def find_company_fallback(lines, title):
-    if title not in lines:
-        return "Non indiqué"
+def find_dates(text):
+    dates = re.findall(r"\b\d{2}/\d{2}/\d{4}\b", text)
 
-    title_index = lines.index(title)
+    # On retire les doublons en gardant l’ordre.
+    unique_dates = []
+    for date in dates:
+        if date not in unique_dates:
+            unique_dates.append(date)
 
-    for candidate in reversed(lines[max(0, title_index - 5):title_index]):
-        candidate_normalized = normalize(candidate)
+    start_date = unique_dates[0] if len(unique_dates) >= 1 else "Non indiqué"
+    end_date = unique_dates[1] if len(unique_dates) >= 2 else "Non indiqué"
 
-        if candidate_normalized not in ["logo entreprise", "image", "dernieres offres", "last offers"]:
-            if len(candidate) <= 80:
-                return candidate
+    return start_date, end_date
+
+
+def find_salary(text):
+    matches = re.findall(r"\b\d{3,5}\s*€", text)
+
+    if matches:
+        return matches[-1]
 
     return "Non indiqué"
 
 
-def find_location_fallback(lines, title):
-    if title not in lines:
-        return "Non indiqué", "Non indiqué"
+def find_duration(text):
+    patterns = [
+        r"Durée\s*\(mois\)\s*(\d+)",
+        r"Durée\s*[:\-]?\s*(\d+)\s*mois",
+        r"Duration\s*\(months\)\s*(\d+)",
+        r"Duration\s*[:\-]?\s*(\d+)\s*months"
+    ]
 
-    title_index = lines.index(title)
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            return match.group(1)
 
-    for candidate in lines[title_index + 1:title_index + 8]:
-        if " - " in candidate and len(candidate) <= 100:
-            parts = candidate.split(" - ", 1)
-            if len(parts) == 2:
-                country = clean_text(parts[0])
-                city = clean_text(parts[1])
-                return country, city
+    return "Non indiqué"
+
+
+def find_country_city(lines):
+    countries = [
+        "ETATS-UNIS", "ÉTATS-UNIS", "ALLEMAGNE", "ESPAGNE", "ITALIE", "ROYAUME-UNI",
+        "CANADA", "BELGIQUE", "SUISSE", "SINGAPOUR", "THAILANDE", "THAÏLANDE",
+        "JAPON", "CHINE", "HONG KONG", "AUSTRALIE", "SUEDE", "SUÈDE",
+        "NORVEGE", "NORVÈGE", "DANEMARK", "PAYS-BAS", "PORTUGAL"
+    ]
+
+    for line in lines:
+        line_upper = line.upper()
+
+        for country in countries:
+            if country in line_upper:
+                country_clean = country.replace("É", "E").replace("È", "E")
+
+                # Cas fréquent : ETATS-UNIS - NEW-YORK -NY-
+                if " - " in line:
+                    parts = [clean_text(part) for part in line.split(" - ") if clean_text(part)]
+                    if len(parts) >= 2:
+                        return country_clean, " - ".join(parts[1:])
+
+                return country_clean, "Non indiqué"
 
     return "Non indiqué", "Non indiqué"
 
 
 def get_offer_details(page, url):
-    text, html, final_url = get_rendered_page(page, url)
-    lines = lines_from_text(text)
+    text = get_page_text(page, url)
+    lines = get_lines(text)
 
-    title = find_title(lines, html)
+    print("----- TEXTE LU SUR LA PAGE -----")
+    for line in lines[:80]:
+        print(line)
+    print("----- FIN TEXTE LU -----")
 
-    company = get_value_after_label(lines, ["Entreprise", "Company"])
-    duration = get_value_after_label(lines, ["Durée (mois)", "Durée", "Duration (months)", "Duration"])
-    city = get_value_after_label(lines, ["Ville", "City"])
-    country = get_value_after_label(lines, ["Pays", "Country"])
-    salary = get_value_after_label(lines, ["Salaire", "Salary", "Indemnité", "Allowance"])
-    start_date = get_value_after_label(lines, ["Début", "Date de début", "Start", "Start date"])
-    end_date = get_value_after_label(lines, ["Fin", "Date de fin", "End", "End date"])
+    title = find_title(lines)
 
-    if company == "Non indiqué":
-        company = find_company_fallback(lines, title)
+    company = find_after(lines, ["Entreprise", "Company"])
+    duration = find_duration(text)
 
-    fallback_country, fallback_city = find_location_fallback(lines, title)
+    country = find_after(lines, ["Pays", "Country"])
+    city = find_after(lines, ["Ville", "City"])
+
+    fallback_country, fallback_city = find_country_city(lines)
 
     if country == "Non indiqué":
         country = fallback_country
@@ -213,18 +206,21 @@ def get_offer_details(page, url):
     if city == "Non indiqué":
         city = fallback_city
 
-    dates = re.findall(r"\b\d{2}/\d{2}/\d{4}\b", text)
+    salary = find_after(lines, ["Salaire", "Indemnité", "Allowance", "Salary"])
 
-    if start_date == "Non indiqué" and len(dates) >= 1:
-        start_date = dates[0]
+    if salary == "Non indiqué":
+        salary = find_salary(text)
 
-    if end_date == "Non indiqué" and len(dates) >= 2:
-        end_date = dates[1]
+    start_date = find_after(lines, ["Début", "Date de début", "Start", "Start date"])
+    end_date = find_after(lines, ["Fin", "Date de fin", "End", "End date"])
 
-    salary_match = re.search(r"\b\d{3,5}\s*€", text)
+    fallback_start, fallback_end = find_dates(text)
 
-    if salary == "Non indiqué" and salary_match:
-        salary = salary_match.group(0)
+    if start_date == "Non indiqué":
+        start_date = fallback_start
+
+    if end_date == "Non indiqué":
+        end_date = fallback_end
 
     return {
         "title": title,
@@ -239,25 +235,6 @@ def get_offer_details(page, url):
     }
 
 
-def offer_is_valid(offer):
-    if offer["title"] == "Nouvelle offre V.I.E":
-        return False
-
-    fields = [
-        offer["company"],
-        offer["duration"],
-        offer["city"],
-        offer["country"],
-        offer["salary"],
-        offer["start_date"],
-        offer["end_date"]
-    ]
-
-    non_indique_count = fields.count("Non indiqué")
-
-    return non_indique_count < len(fields)
-
-
 def send_to_discord(offer):
     payload = {
         "username": "Alerte VIE",
@@ -267,41 +244,13 @@ def send_to_discord(offer):
                 "url": offer["url"],
                 "color": 3447003,
                 "fields": [
-                    {
-                        "name": "Entreprise",
-                        "value": offer["company"],
-                        "inline": False
-                    },
-                    {
-                        "name": "Durée (mois)",
-                        "value": offer["duration"],
-                        "inline": True
-                    },
-                    {
-                        "name": "Ville",
-                        "value": offer["city"],
-                        "inline": True
-                    },
-                    {
-                        "name": "Pays",
-                        "value": offer["country"],
-                        "inline": True
-                    },
-                    {
-                        "name": "$ Salaire",
-                        "value": offer["salary"],
-                        "inline": True
-                    },
-                    {
-                        "name": "Début",
-                        "value": offer["start_date"],
-                        "inline": True
-                    },
-                    {
-                        "name": "Fin",
-                        "value": offer["end_date"],
-                        "inline": True
-                    },
+                    {"name": "Entreprise", "value": offer["company"], "inline": False},
+                    {"name": "Durée (mois)", "value": offer["duration"], "inline": True},
+                    {"name": "Ville", "value": offer["city"], "inline": True},
+                    {"name": "Pays", "value": offer["country"], "inline": True},
+                    {"name": "$ Salaire", "value": offer["salary"], "inline": True},
+                    {"name": "Début", "value": offer["start_date"], "inline": True},
+                    {"name": "Fin", "value": offer["end_date"], "inline": True},
                     {
                         "name": "Lien",
                         "value": f"[Voir l'offre sur Business France]({offer['url']})",
@@ -327,10 +276,7 @@ def main():
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage"
-            ]
+            args=["--no-sandbox", "--disable-dev-shm-usage"]
         )
 
         context = browser.new_context(
@@ -354,20 +300,15 @@ def main():
 
         print(f"{len(new_links)} nouvelle(s) offre(s) détectée(s).")
 
-        for link in reversed(new_links[:10]):
+        for link in reversed(new_links[:5]):
             offer_page = context.new_page()
 
             try:
                 offer = get_offer_details(offer_page, link)
-
-                if not offer_is_valid(offer):
-                    print(f"Offre ignorée car extraction incomplète : {link}")
-                    continue
-
                 send_to_discord(offer)
                 seen.add(link)
 
-                print(f"Envoyé sur Discord : {offer['title']}")
+                print(f"Envoyé : {offer['title']}")
 
             except Exception as e:
                 print(f"Erreur avec {link} : {e}")
