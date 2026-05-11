@@ -42,6 +42,46 @@ def save_seen(seen):
         json.dump(sorted(list(seen)), f, ensure_ascii=False, indent=2)
 
 
+def french_date_to_number(date_text):
+    months = {
+        "janvier": "01",
+        "fevrier": "02",
+        "février": "02",
+        "mars": "03",
+        "avril": "04",
+        "mai": "05",
+        "juin": "06",
+        "juillet": "07",
+        "aout": "08",
+        "août": "08",
+        "septembre": "09",
+        "octobre": "10",
+        "novembre": "11",
+        "decembre": "12",
+        "décembre": "12",
+    }
+
+    match = re.search(
+        r"(\d{1,2})\s+([A-Za-zÀ-ÿ]+)\s+(\d{4})",
+        date_text,
+        re.IGNORECASE,
+    )
+
+    if not match:
+        return clean_text(date_text)
+
+    day = match.group(1).zfill(2)
+    month_text = normalize(match.group(2))
+    year = match.group(3)
+
+    month = months.get(month_text)
+
+    if not month:
+        return clean_text(date_text)
+
+    return f"{day}/{month}/{year}"
+
+
 def get_page_text(page, url):
     print(f"Ouverture : {url}")
 
@@ -53,9 +93,21 @@ def get_page_text(page, url):
     page.wait_for_timeout(10000)
 
     try:
+        cookie_button = page.get_by_text("Tout refuser", exact=True)
+        if cookie_button.count() > 0:
+            cookie_button.first.click(timeout=3000)
+            page.wait_for_timeout(2000)
+    except Exception:
+        pass
+
+    try:
         return page.locator("body").inner_text(timeout=15000)
     except Exception:
         return ""
+
+
+def get_lines(text):
+    return [clean_text(line) for line in text.splitlines() if clean_text(line)]
 
 
 def extract_offer_links(page):
@@ -75,110 +127,162 @@ def extract_offer_links(page):
         match = re.search(r"/offres/(\d+)", href)
         if match:
             offer_url = f"{BASE_URL}/offres/{match.group(1)}"
+
             if offer_url not in links:
                 links.append(offer_url)
 
-    print(f"Liens trouvés : {links}")
+    print(f"{len(links)} lien(s) trouvé(s).")
+    print(links)
+
     return links[:10]
-
-
-def get_lines(text):
-    return [clean_text(line) for line in text.splitlines() if clean_text(line)]
-
-
-def find_after(lines, possible_labels):
-    labels = [normalize(label) for label in possible_labels]
-
-    for i, line in enumerate(lines):
-        line_n = normalize(line)
-
-        for label in labels:
-            if line_n == label or line_n.startswith(label):
-                for value in lines[i + 1:i + 6]:
-                    value_n = normalize(value)
-
-                    if value_n not in labels and len(value) <= 120:
-                        return value
-
-    return "Non indiqué"
 
 
 def find_title(lines):
     for line in lines:
-        if "(H/F)" in line or "(F/H)" in line or "(M/F)" in line:
-            return line
-
-    for line in lines:
-        if len(line) > 10 and line.isupper():
+        if "(H/F)" in line or "(F/H)" in line or "(H/F/X)" in line or "(H/F/N)" in line:
             return line
 
     return "Nouvelle offre V.I.E"
 
 
-def find_dates(text):
-    dates = re.findall(r"\b\d{2}/\d{2}/\d{4}\b", text)
+def find_company(lines, title):
+    for line in lines:
+        if normalize(line).startswith("etablissement"):
+            parts = line.split(":", 1)
+            if len(parts) == 2:
+                return clean_text(parts[1])
 
-    # On retire les doublons en gardant l’ordre.
-    unique_dates = []
-    for date in dates:
-        if date not in unique_dates:
-            unique_dates.append(date)
+    if title in lines:
+        index = lines.index(title)
 
-    start_date = unique_dates[0] if len(unique_dates) >= 1 else "Non indiqué"
-    end_date = unique_dates[1] if len(unique_dates) >= 2 else "Non indiqué"
+        if index > 0:
+            possible_company = lines[index - 1]
 
-    return start_date, end_date
+            bad_values = [
+                "retour",
+                "favoris",
+                "postuler",
+                "tout accepter",
+                "tout refuser",
+                "se connecter",
+            ]
 
-
-def find_salary(text):
-    matches = re.findall(r"\b\d{3,5}\s*€", text)
-
-    if matches:
-        return matches[-1]
-
-    return "Non indiqué"
-
-
-def find_duration(text):
-    patterns = [
-        r"Durée\s*\(mois\)\s*(\d+)",
-        r"Durée\s*[:\-]?\s*(\d+)\s*mois",
-        r"Duration\s*\(months\)\s*(\d+)",
-        r"Duration\s*[:\-]?\s*(\d+)\s*months"
-    ]
-
-    for pattern in patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            return match.group(1)
+            if normalize(possible_company) not in bad_values:
+                return possible_company
 
     return "Non indiqué"
+
+
+def parse_location_from_line(line):
+    line = clean_text(line)
+
+    if "(H/F)" in line or "(F/H)" in line:
+        return None, None
+
+    if " VIE " in line and "mois" in line.lower():
+        return None, None
+
+    match = re.search(r"^(.+?)\s*\((.+?)\)$", line)
+
+    if match:
+        country = clean_text(match.group(1))
+        city = clean_text(match.group(2))
+        return country, city
+
+    if " - " in line:
+        parts = [clean_text(part) for part in line.split(" - ") if clean_text(part)]
+
+        if len(parts) >= 2:
+            country = parts[0]
+            city = " - ".join(parts[1:])
+            return country, city
+
+    return None, None
+
+
+def find_mission_block(lines):
+    for i, line in enumerate(lines):
+        if normalize(line) == "la mission":
+            return lines[i + 1:i + 15]
+
+    return []
 
 
 def find_country_city(lines):
-    countries = [
-        "ETATS-UNIS", "ÉTATS-UNIS", "ALLEMAGNE", "ESPAGNE", "ITALIE", "ROYAUME-UNI",
-        "CANADA", "BELGIQUE", "SUISSE", "SINGAPOUR", "THAILANDE", "THAÏLANDE",
-        "JAPON", "CHINE", "HONG KONG", "AUSTRALIE", "SUEDE", "SUÈDE",
-        "NORVEGE", "NORVÈGE", "DANEMARK", "PAYS-BAS", "PORTUGAL"
-    ]
+    mission_block = find_mission_block(lines)
+
+    for line in mission_block:
+        country, city = parse_location_from_line(line)
+
+        if country and city:
+            return country, city
 
     for line in lines:
-        line_upper = line.upper()
+        country, city = parse_location_from_line(line)
 
-        for country in countries:
-            if country in line_upper:
-                country_clean = country.replace("É", "E").replace("È", "E")
-
-                # Cas fréquent : ETATS-UNIS - NEW-YORK -NY-
-                if " - " in line:
-                    parts = [clean_text(part) for part in line.split(" - ") if clean_text(part)]
-                    if len(parts) >= 2:
-                        return country_clean, " - ".join(parts[1:])
-
-                return country_clean, "Non indiqué"
+        if country and city:
+            return country, city
 
     return "Non indiqué", "Non indiqué"
+
+
+def find_dates_and_duration(lines):
+    mission_block = find_mission_block(lines)
+
+    all_lines = mission_block + lines
+
+    for line in all_lines:
+        match = re.search(
+            r"du\s+(.+?)\s+au\s+(.+?)\s*\((\d+)\s*mois\)",
+            line,
+            re.IGNORECASE,
+        )
+
+        if match:
+            start_date = french_date_to_number(match.group(1))
+            end_date = french_date_to_number(match.group(2))
+            duration = match.group(3)
+            return start_date, end_date, duration
+
+    for line in all_lines:
+        match = re.search(
+            r"du\s+(.+?)\s+au\s+(.+)",
+            line,
+            re.IGNORECASE,
+        )
+
+        if match:
+            start_date = french_date_to_number(match.group(1))
+            end_date = french_date_to_number(match.group(2))
+            return start_date, end_date, "Non indiqué"
+
+    duration = "Non indiqué"
+
+    for line in lines:
+        match = re.search(r"\b(\d+)\s*mois\b", line, re.IGNORECASE)
+
+        if match:
+            duration = match.group(1)
+            break
+
+    return "Non indiqué", "Non indiqué", duration
+
+
+def find_salary(lines):
+    for line in lines:
+        if "REMUNERATION MENSUELLE" in line.upper():
+            match = re.search(r"([0-9][0-9\s]*(?:[.,]\d+)?)\s*€", line)
+
+            if match:
+                return clean_text(match.group(1)) + " €"
+
+    for line in lines:
+        match = re.search(r"([0-9][0-9\s]*(?:[.,]\d+)?)\s*€", line)
+
+        if match:
+            return clean_text(match.group(1)) + " €"
+
+    return "Non indiqué"
 
 
 def get_offer_details(page, url):
@@ -186,41 +290,15 @@ def get_offer_details(page, url):
     lines = get_lines(text)
 
     print("----- TEXTE LU SUR LA PAGE -----")
-    for line in lines[:80]:
+    for line in lines[:120]:
         print(line)
     print("----- FIN TEXTE LU -----")
 
     title = find_title(lines)
-
-    company = find_after(lines, ["Entreprise", "Company"])
-    duration = find_duration(text)
-
-    country = find_after(lines, ["Pays", "Country"])
-    city = find_after(lines, ["Ville", "City"])
-
-    fallback_country, fallback_city = find_country_city(lines)
-
-    if country == "Non indiqué":
-        country = fallback_country
-
-    if city == "Non indiqué":
-        city = fallback_city
-
-    salary = find_after(lines, ["Salaire", "Indemnité", "Allowance", "Salary"])
-
-    if salary == "Non indiqué":
-        salary = find_salary(text)
-
-    start_date = find_after(lines, ["Début", "Date de début", "Start", "Start date"])
-    end_date = find_after(lines, ["Fin", "Date de fin", "End", "End date"])
-
-    fallback_start, fallback_end = find_dates(text)
-
-    if start_date == "Non indiqué":
-        start_date = fallback_start
-
-    if end_date == "Non indiqué":
-        end_date = fallback_end
+    company = find_company(lines, title)
+    country, city = find_country_city(lines)
+    start_date, end_date, duration = find_dates_and_duration(lines)
+    salary = find_salary(lines)
 
     return {
         "title": title,
@@ -231,7 +309,7 @@ def get_offer_details(page, url):
         "salary": salary,
         "start_date": start_date,
         "end_date": end_date,
-        "url": url
+        "url": url,
     }
 
 
@@ -254,14 +332,14 @@ def send_to_discord(offer):
                     {
                         "name": "Lien",
                         "value": f"[Voir l'offre sur Business France]({offer['url']})",
-                        "inline": False
-                    }
+                        "inline": False,
+                    },
                 ],
                 "footer": {
                     "text": "Alerte VIE • Business France"
-                }
+                },
             }
-        ]
+        ],
     }
 
     response = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=30)
@@ -276,7 +354,7 @@ def main():
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage"]
+            args=["--no-sandbox", "--disable-dev-shm-usage"],
         )
 
         context = browser.new_context(
@@ -285,7 +363,7 @@ def main():
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/124.0.0.0 Safari/537.36"
-            )
+            ),
         )
 
         page = context.new_page()
