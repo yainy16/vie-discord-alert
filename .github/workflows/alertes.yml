@@ -24,7 +24,7 @@ jobs:
       - name: Installer les dépendances
         run: |
           pip install -r requirements.txt
-          playwright install chromium
+          playwright install --with-deps chromium
 
       - name: Vérifier les nouvelles offres
         env:
